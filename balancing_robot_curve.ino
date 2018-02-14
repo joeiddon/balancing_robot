@@ -19,42 +19,59 @@
 #define DIR_PIN_2                            5
 #define STEP_PIN_2                         4
 
+/*
+ * MAX ACCELERATION IS 1000 (90deg), MAX GYRO IS ~2000 (big push)
+ */
 
 #define ACC_OFFSET      0
-#define GYRO_OFFSET     -60
+#define GYRO_OFFSET     -65
 
+#define ACC_SAMPLES     255                     //number of times to sample accelerometer (max 255)
+#define GYRO_SAMPLES    32                     //number of times to sample gyro (max 255)
 
-#define ACC_SAMPLES     64                     //number of times to sample accelerometer (max 255)
-#define GYRO_SAMPLES    16                     //number of times to sample gyro (max 255)
+#define TARGET  0           //target angle (units are in accels, so -1000 <--> 1000)
 
-#define MIN_HALFPULSE 116                    //minimum halfpulse
-#define MAX_PID   1048576 //131078 //12288     //maximum expected pid
+#define POINTS  17           //number of points to map acceleration between
+#define MAX_X 1000          //max value acc+gyro will be
 
-#define TARGET  0                     //target angle
+#define KD      0  //derivative
 
-#define KP      34                 //proportion  ///3 AND 0.2 ARE OK W/ 131078
-#define KD      2        //derivative
-
-#define DEBUG   -1 //modes 0 and 1 for serial debugging
+#define DEBUG   0           //debug mode (serial output) mode 0 = no mode
 
 #define DEAD_ZONE 0
-#define FALL_ZONE 750   
+#define FALL_ZONE 850
 
-uint32_t loop_counter = 0;            //how many loops have we done?
+int16_t speeds[] = {999, 
+    20000, 10000,  4000,  1700,  1100, 
+      900,   450,   390,   250,   180, 
+      140,   130,   120,   120,   120, 
+      120,   120,   120,   120,   120, 
+      120,   120,   120,   120,   120, 
+      120,   120  };
+const int16_t interval_width = MAX_X / POINTS;
 
-int16_t acc_arr[ACC_SAMPLES];     //array to store accelerations
-int8_t    acc_arr_p = 0;                    //pointer to our averaging array
+uint32_t loop_counter = 0;        //how many loops have we done? - used for main switch statement
 
-int16_t gyro_arr[GYRO_SAMPLES];     //array to store accelerations
-int8_t    gyro_arr_p = 0;                    //pointer to our averaging array
+int16_t acc_arr[ACC_SAMPLES];     //array to store accelerations - for averaging
+int16_t  acc_arr_p = 0;            //pointer to our averaging array - where should our next sample be placed
 
-uint32_t lastpulse_us = 0;            //when did we last send a pulse?
-uint32_t halfpulse_us = 250;        //what would be the ideal time between pulses?
-uint8_t halfpulse_count;                //how many half pulses have we done
+int16_t gyro_arr[GYRO_SAMPLES];   //array to store accelerations - for averaging
+int16_t  gyro_arr_p = 0;           //pointer to our averaging array - where should our next sample be placed
 
-int8_t dir = 1;                                 //what direction
+uint32_t lastpulse_us = 0;        //when did we last send a pulse? - so we know when to send our next one
+uint16_t halfpulse_us = 250;      //what would be the ideal time between pulses? - this is just to start, obvs modified by PID
+uint8_t  halfpulse_count;         //how many half pulses have we done - so we know which way to set the motor pins
 
-uint8_t buf[12];                                //buffer to store accelerometer readings
+int8_t dir = 1;                   //what direction
+
+uint8_t buf[12];                  //buffer to store accelerometer readings
+uint8_t buf_p;                    //buffer pointer
+
+int32_t sum;
+uint32_t loop_us;
+
+int16_t ax, gx, avg_acc, avg_gyro, x, l;
+//uint16_t ;
 
 void setup() {
     Serial.begin(500000);
@@ -64,22 +81,14 @@ void setup() {
 }
 
 void loop() {
-    int32_t sum, p, d, pid;
-    uint32_t loop_us;
-    
-    int16_t ax, gx, avg_acc, avg_gyro;
-    //uint16_t ;
-    
     loop_counter++;
     loop_us = micros();
-
-    //halfpulse_us = MIN_HALFPULSE;
-
+    
     if ((loop_us - lastpulse_us) >= halfpulse_us) { //time to step the motors
         lastpulse_us += halfpulse_us;  //make it so it looks like we stepped at the right time (even if didn't)
         halfpulse_count++;  //doing a change, so increment halfpulse_count
 
-        if (dir) {
+        if (dir) {          //so that if in a dead zone, we can not step (when 0)
             digitalWrite(DIR_PIN_1, dir == -1);
             digitalWrite(DIR_PIN_2, dir == 1);
             digitalWrite(STEP_PIN_1, halfpulse_count & 0x1);
@@ -89,6 +98,7 @@ void loop() {
 
     switch (loop_counter & 0x0f) {
         case 0:
+            //point to register 59 - start of accel, temp and gyro registers
             Wire.beginTransmission(MPU9250_ADDRESS);
             Wire.write(0x3B);
             Wire.endTransmission();
@@ -97,79 +107,82 @@ void loop() {
             Wire.requestFrom(MPU9250_ADDRESS, 12);
             break;
         case 2:
-            uint8_t i;
+            buf_p = 0;
             while (Wire.available()) {
-                buf[i++] = Wire.read();
+                buf[buf_p++] = Wire.read();
             }
             break;
         case 4:
-            ax = buf[0] << 8 | buf[1] + ACC_OFFSET;
-            gx = buf[10] << 8 | buf[11] + GYRO_OFFSET;
+            //calculate the current readings
+            ax = (buf[0] << 8 | buf[1]) + ACC_OFFSET;
+            gx = (buf[10] << 8 | buf[11]) + GYRO_OFFSET;
 
-            //set element at pointer in accelereation array
-            //to current accelerometer reading
+            //set element at pointer in array to current reading
             //then update the pointer (by adding 1 and modding)
             acc_arr[acc_arr_p] = ax;
             acc_arr_p = (acc_arr_p + 1) % ACC_SAMPLES;
 
             gyro_arr[gyro_arr_p] = gx;
             gyro_arr_p = (gyro_arr_p + 1) % GYRO_SAMPLES;
-
-            //average the accelerometer readings
-            //for a smooth reading to do PID with
+            break;
+        case 5:
+            //average the accel and gyro readings
             sum = 0;
             for (int i = 0; i < ACC_SAMPLES; i++) {
                 sum += acc_arr[i];
             }
-            avg_acc =    sum / ACC_SAMPLES;
-
-            //average the gyro readings
-            //for a smooth reading to do PID with
+            avg_acc = sum / ACC_SAMPLES;
+            
             sum = 0;
             for (int i = 0; i < GYRO_SAMPLES; i++) {
                 sum += gyro_arr[i];
             }
-            avg_gyro =    sum / GYRO_SAMPLES;
-
+            avg_gyro = sum / GYRO_SAMPLES;
+            break;
+        case 6:
             //calculate proportional and derivative terms
-
-            p = KP * (avg_acc - TARGET);
-            d = KD * avg_gyro * -1;
+            x = (avg_acc - TARGET) + KD * avg_gyro * -1;
             
-            //add them together to get our output
-            pid = p + d;
+            if (x < 0){
+                dir = 1;
+                x *= -1;
+            } else {
+                dir = -1;
+            }
 
-            //pid is now the right "throttle" to work with
-            //just now assign to motors
+            if (x < MAX_X){
+                l = x / interval_width;
+                halfpulse_us = speeds[l];
+                if (l == 0) dir = 0;
+                //halfpulse_us = map_range(x, l * interval_width, (l+1) * interval_width, speeds[l], speeds[l+1]);
+            } else {
+                halfpulse_us = speeds[POINTS];
+            }
 
-            dir = pid > 0 ? -1 : 1;
-
-            if (pid < 0) pid *= -1;
-
-            halfpulse_us = pid ? MIN_HALFPULSE + MAX_PID / pid : 4294967295;        //using ternary to remove divide by 0 error
-
+            /*
             //check if in fall or dead zone
-            if ((avg_acc > -DEAD_ZONE && avg_acc < DEAD_ZONE) || (avg_acc < -FALL_ZONE || avg_acc > FALL_ZONE)) dir = 0;
+            if ((avg_acc > -DEAD_ZONE && avg_acc speeds[x / interval_width < DEAD_ZONE) || (avg_acc < -FALL_ZONE || avg_acc > FALL_ZONE)) dir = 0;
 
             //set led to indicate if in a motionless zone
-            digitalWrite(13, !dir);
-
+            digitalWrite(13, !dir);*/
+            break;
+        case 7:
             switch (DEBUG){
                 case 1:
-                    Serial.print(4000);
+                    Serial.print(3000);
                     Serial.print("\t");
-                    Serial.print(-4000);
+                    Serial.print(-3000);
                     Serial.print("\t");
-                    Serial.print(gx);
+                    Serial.print(avg_acc);
                     Serial.print("\t");
-                    //Serial.print(p);
-                    //Serial.print("\t");
-                    //Serial.print(d);
-                    //Serial.print("\t");
-                    Serial.println(avg_gyro);
+                    Serial.print(avg_gyro);
+                    Serial.print("\t");
+                    Serial.println(x);
                     break;
-                case 2:      
-                    Serial.print(pid);
+                case 2:
+                    Serial.print(1400);
+                    Serial.print("\t");
+                    Serial.print(-1400);
                     Serial.print("\t");
                     Serial.println(halfpulse_us);
                     break;
@@ -180,9 +193,12 @@ void loop() {
                     Serial.println();
                     break;
             }
-            
             break;
     }
+}
+
+uint16_t map_range(int16_t i, int16_t a, int16_t b, int16_t c, int16_t d){
+    return (i - a) * ((float)(d-c)/(b-a)) + c;
 }
 
 void configureSteppers() {
